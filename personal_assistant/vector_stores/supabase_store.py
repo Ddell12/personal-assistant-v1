@@ -107,8 +107,8 @@ class SupabaseVectorStore:
         Returns True if the database is properly set up, False otherwise.
         """
         try:
-            # Check if the documents table exists
-            response = self.cli.table("documents").select("count(*)", count="exact").execute()
+            # Check if the documents table exists - use a simpler approach
+            response = self.cli.from_("documents").select("id").limit(1).execute()
             if hasattr(response, 'error') and response.error:
                 print(f"Error checking documents table: {response.error}")
                 return False
@@ -120,10 +120,10 @@ class SupabaseVectorStore:
                 sql = """
                 SELECT 1 
                 FROM documents 
-                WHERE embedding <=> %(vec)s::vector 
+                WHERE embedding <=> $1::vector 
                 LIMIT 1;
                 """
-                self.cli.postgrest.rpc("exec_sql", {"sql": sql, "params": {"vec": dummy_vector}}).execute()
+                response = self.cli.rpc("exec_sql", {"sql": sql, "params": [dummy_vector]}).execute()
                 # If we get here without exception, the vector extension is working
                 return True
             except Exception as e:
@@ -202,7 +202,7 @@ class SupabaseVectorStore:
             }
             
             # Insert or update the document
-            response = self.cli.table("documents").upsert(row).execute()
+            response = self.cli.from_("documents").upsert(row).execute()
             
             if hasattr(response, 'error') and response.error:
                 raise RuntimeError(f"Upsert error: {response.error}")
@@ -255,7 +255,7 @@ class SupabaseVectorStore:
                     
                     # Insert or update in a single transaction
                     if rows:
-                        response = self.cli.table("documents").upsert(rows).execute()
+                        response = self.cli.from_("documents").upsert(rows).execute()
                         if hasattr(response, 'error') and response.error:
                             raise RuntimeError(f"Batch upsert error: {response.error}")
                         
@@ -269,7 +269,14 @@ class SupabaseVectorStore:
 
     def search(self, query: str, top_k: int = _TOPK_DEFAULT) -> t.List[dict]:
         """
-        Search for documents similar to the query.
+        Search for documents similar to the query using the search_vectors stored procedure.
+        
+        Args:
+            query: The search query text
+            top_k: Maximum number of results to return
+            
+        Returns:
+            List of matching documents with similarity scores
         """
         try:
             if not query.strip():
@@ -278,29 +285,26 @@ class SupabaseVectorStore:
             # Generate embedding for the query
             q_emb = _embed_single(query)
             
-            # Perform vector similarity search with simpler SQL that's more likely to work
-            sql = """
-            SELECT  
-                doc_id,
-                content,
-                metadata,
-                1 - (embedding <=> $1::vector) as score
-            FROM    
-                documents
-            ORDER BY 
-                embedding <=> $1::vector
-            LIMIT   
-                $2
-            """
+            # Call the search_vectors function directly
+            # This is more reliable than going through the generic exec_sql RPC
+            print(f"Calling search_vectors directly with top_k={top_k}")
+            print(f"Vector length: {len(q_emb)}")
             
-            # This calls the function with proper parameters
+            # Direct function call to the stored procedure
             response = self.cli.rpc(
-                "exec_sql", 
-                {"sql": sql, "params": {"vec": q_emb, "k": top_k}}
+                "search_vectors",
+                {
+                    "query_embedding": q_emb,
+                    "match_count": top_k,
+                    "min_score": 0.0      # optional
+                }
             ).execute()
             
-            if hasattr(response, 'error') and response.error:
-                print(f"Vector search error: {response.error}")
+            print(f"Vector search response data: {response.data if hasattr(response, 'data') else 'No data'}")
+            
+            # Only fall back if no data or empty data
+            if not hasattr(response, 'data') or not response.data:
+                print("Vector search returned no results, falling back to text search")
                 return self.search_fallback(query, top_k)
                 
             # Process results
@@ -314,10 +318,6 @@ class SupabaseVectorStore:
                     except json.JSONDecodeError:
                         pass
             
-            if not rows:
-                # If no results from vector search, try the fallback
-                return self.search_fallback(query, top_k)
-                
             return rows
             
         except Exception as e:
@@ -354,12 +354,12 @@ class SupabaseVectorStore:
                 project_name = query.lower().split("project")[1].strip().split()[0]
                 if project_name:
                     search_term = f"%project {project_name}%"
-                    response = self.cli.table("documents").select("*").ilike("content", search_term).limit(top_k).execute()
+                    response = self.cli.from_("documents").select("*").ilike("content", search_term).limit(top_k).execute()
                     if response.data and len(response.data) > 0:
                         return response.data
             
             # Last resort: just get all documents and filter client-side
-            response = self.cli.table("documents").select("*").limit(100).execute()
+            response = self.cli.from_("documents").select("*").limit(100).execute()
             
             if response.data:
                 # Simple client-side search
@@ -384,7 +384,7 @@ class SupabaseVectorStore:
             
             # Absolute last resort - just return any documents
             try:
-                return self.cli.table("documents").select("*").limit(top_k).execute().data or []
+                return self.cli.from_("documents").select("*").limit(top_k).execute().data or []
             except:
                 return []
 
@@ -399,7 +399,7 @@ class SupabaseVectorStore:
             True if deletion was successful, False otherwise
         """
         try:
-            response = self.cli.table("documents").delete().eq("doc_id", doc_id).execute()
+            response = self.cli.from_("documents").delete().eq("doc_id", doc_id).execute()
             
             if hasattr(response, 'error') and response.error:
                 raise RuntimeError(f"Delete error: {response.error}")
@@ -425,17 +425,18 @@ class SupabaseVectorStore:
             return 0
             
         try:
-            # Format list for SQL IN clause
-            doc_ids_str = ", ".join(f"'{doc_id}'" for doc_id in doc_ids)
-            
-            # Use SQL for bulk delete
-            sql = f"""
+            # Use array parameters instead of string concatenation for safety
+            sql = """
             DELETE FROM documents 
-            WHERE doc_id IN ({doc_ids_str})
+            WHERE doc_id = ANY($1::text[])
             RETURNING doc_id;
             """
             
-            response = self.cli.postgrest.rpc("exec_sql", {"sql": sql, "params": {}}).execute()
+            # Pass the array as a parameter
+            response = self.cli.rpc("exec_sql", {
+                "sql": sql, 
+                "params": [doc_ids]  # Pass as positional parameter
+            }).execute()
             
             if hasattr(response, 'error') and response.error:
                 raise RuntimeError(f"Batch delete error: {response.error}")
@@ -458,7 +459,7 @@ class SupabaseVectorStore:
             Document record or None if not found
         """
         try:
-            response = self.cli.table("documents").select("*").eq("doc_id", doc_id).execute()
+            response = self.cli.from_("documents").select("*").eq("doc_id", doc_id).execute()
             
             if hasattr(response, 'error') and response.error:
                 raise RuntimeError(f"Get document error: {response.error}")
@@ -491,11 +492,8 @@ class SupabaseVectorStore:
             The document count
         """
         try:
-            response = self.cli.table("documents").select("count(*)", count="exact").execute()
-            
-            if hasattr(response, 'error') and response.error:
-                raise RuntimeError(f"Count error: {response.error}")
-                
+            # Use count='exact' but without trying to SELECT count(*)
+            response = self.cli.from_("documents").select("id", count='exact').execute()
             return response.count if hasattr(response, 'count') else 0
             
         except Exception as e:

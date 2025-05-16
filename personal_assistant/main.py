@@ -14,7 +14,7 @@ import os
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
-from agent import root_agent  # ← import the agent constructed in agent.py
+from .agent import root_agent  # ← import the agent constructed in agent.py
 from memory_service import MEMORY  # ← use Vertex RAG memory service
 
 # ─────────────────────────────────────────────────────────
